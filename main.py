@@ -1,4 +1,4 @@
-# main.py (refactored with conversation memory + pipe.recv logging)
+# main.py (minimal, robot_control_prompt 전용)
 import openai
 import os
 import traceback
@@ -6,20 +6,18 @@ import multiprocessing
 import logging
 from contextlib import redirect_stdout
 from io import StringIO
+import time
 
 from api import API
 from env import run_environment
-from prompts.main_prompt import MAIN_PROMPT
-from prompts.error_correction_prompt import ERROR_CORRECTION_PROMPT
-from prompts.print_output_prompt import PRINT_OUTPUT_PROMPT
-from prompts.task_summary_prompt import TASK_SUMMARY_PROMPT
-from prompts.task_failure_prompt import TASK_FAILURE_PROMPT
-
+from prompts.robot_control_prompt import ROBOT_CONTROL_PROMPT
 import models
 
 # Initialize OpenAI API client
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
 client = openai.OpenAI()
+
+MODEL_NAME = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 if __name__ == "__main__":
     logger = multiprocessing.log_to_stderr()
@@ -31,92 +29,86 @@ if __name__ == "__main__":
     env_process = multiprocessing.Process(target=run_environment, args=(child_conn,))
     env_process.start()
 
-    conversation_memory = []  # Accumulate long-term conversation memory across tasks
-
-    while True:
-        command = input("\nEnter a polishing command (or 'exit' to quit): ")
-        if not command or command.lower() in ("exit", "quit"):
-            logger.info("Exiting the robot polishing system.")
-            break
-
-        api.command = command
-        api.completed = False
-        task_failed = False
-        completed = False
-
-        # Inject current command into MAIN_PROMPT
-        system_prompt = MAIN_PROMPT.replace("[INSERT TASK]", command)
-        messages = conversation_memory.copy()  # Start from past memory
-        messages.append({"role": "system", "content": system_prompt})
-
-        messages = models.get_chatgpt_output(client, model_name="gpt-4o-mini", prompt=command, history=messages, role="user")
-
+    try:
         while True:
-            reply = messages[-1]["content"]
-            print("\nAssistant:\n" + reply.strip())
-
-            if "```python" not in reply:
-                user_input = input("Your answer to the assistant (or press Enter to continue): ")
-                messages = models.get_chatgpt_output(client, model_name="gpt-4o-mini", prompt=user_input, history=messages, role="user")
-                continue
-
-            code_blocks = reply.split("```python")
-            block_number = 0
-            for block in code_blocks[1:]:
-                if "```" in block:
-                    code_snippet = block.split("```", 1)[0]
-                    block_number += 1
-                    try:
-                        f = StringIO()
-                        with redirect_stdout(f):
-                            exec(code_snippet, {"api": api})
-
-                        output = f.getvalue()
-
-                        # Also check for responses from env process
-                        if parent_conn.poll():
-                            env_response = parent_conn.recv()
-                            print("[ENV]:", env_response)
-
-                        if output:
-                            if len(output) > 1000:
-                                output = output[:1000] + "\n... (truncated)"
-                            feedback_prompt = PRINT_OUTPUT_PROMPT.replace("[INSERT PRINT STATEMENT OUTPUT]", output)
-                            messages = models.get_chatgpt_output(client, model_name="gpt-4o-mini", prompt=feedback_prompt, history=messages, role="user")
-
-                        if api.check_task_success():
-                            completed = True
-                        task_failed = not completed
-                    except Exception as e:
-                        error_trace = traceback.format_exc()
-                        logger.error(f"Error in code block {block_number}: {e}")
-                        error_prompt = ERROR_CORRECTION_PROMPT.replace("[INSERT BLOCK NUMBER]", str(block_number)) \
-                                                              .replace("[INSERT ERROR MESSAGE]", error_trace)
-                        messages = models.get_chatgpt_output(client, model_name="gpt-4o-mini", prompt=error_prompt, history=messages, role="user")
-                        task_failed = True
-                        break
-
-            if task_failed and not completed:
-                logger.info("[FAIL] The task did not complete successfully. Gathering summary for retry...")
-                summary_request = TASK_SUMMARY_PROMPT.replace("[INSERT TASK]", command)
-                messages = models.get_chatgpt_output(client, model_name="gpt-4o-mini", prompt=summary_request, history=messages, role="user")
-                task_summary = messages[-1]["content"]
-
-                retry_system_prompt = MAIN_PROMPT.replace("[INSERT TASK]", command)
-                retry_system_prompt += "\n" + TASK_FAILURE_PROMPT.replace("[INSERT TASK SUMMARY]", task_summary)
-                logger.info("[RETRY] Prompting the LLM to re-plan and retry the task...")
-                messages = conversation_memory.copy()
-                messages.append({"role": "system", "content": retry_system_prompt})
-                messages = models.get_chatgpt_output(client, model_name="gpt-4o-mini", prompt=command, history=messages, role="user")
-                task_failed = False
-                completed = False
-                continue
-
-            if completed:
-                logger.info("[SUCCESS] The polishing task was completed successfully.")
+            command = input("\nEnter a robot command (or 'exit' to quit): ").strip()
+            if not command or command.lower() in ("exit", "quit"):
+                logger.info("Exiting.")
                 break
 
-        conversation_memory.extend(messages)
+            # 상태 초기화
+            api.command = command
+            api.completed = False
+            try:
+                # 과도한 과거 메모리, 오류 교정, 요약 전부 제거
+                # 오직 시스템 프롬프트 1개 + 유저 메시지 1개
+                messages = [
+                    {"role": "system", "content": ROBOT_CONTROL_PROMPT},
+                    {"role": "user", "content": command},
+                ]
 
-    env_process.terminate()
-    env_process.join()
+                # LLM 호출
+                messages = models.get_chatgpt_output(
+                client,
+                model_name=MODEL_NAME,
+                system_prompt=ROBOT_CONTROL_PROMPT,
+                user_cmd=command,
+                temperature=0.2,
+                )
+
+                reply = messages[-1]["content"]
+                print("\nAssistant:\n" + reply.strip())
+
+                # 코드블록 추출
+                if "```python" not in reply:
+                    print("[WARN] 코드블록을 찾지 못했음. 프롬프트를 점검하세요.")
+                    continue
+
+                # 여러 블록이 와도 첫 블록만 실행
+                code_snippet = reply.split("```python", 1)[1].split("```", 1)[0]
+
+                # 코드 실행
+                f = StringIO()
+                try:
+                    with redirect_stdout(f):
+                        # 실행 환경에 api와 __USER_MESSAGE__를 제공
+                        exec(code_snippet, {"api": api, "__USER_MESSAGE__": command})
+                except Exception as e:
+                    error_trace = traceback.format_exc()
+                    print("[EXEC-ERROR]\n", error_trace)
+                    continue
+                finally:
+                    output = f.getvalue()
+                    if output:
+                        print("[PRINT]:")
+                        print(output if len(output) < 2000 else output[:2000] + "\n... (truncated)")
+
+                # env 메시지 비우기
+                t0 = time.time()
+                while time.time() - t0 < 1.0:
+                    if parent_conn.poll():
+                        env_response = parent_conn.recv()
+                        api.ingest_env_message(env_response)   # ← 이 줄 추가
+                        print("[ENV]:", env_response)
+                    else:
+                        time.sleep(0.05)
+
+                # 성공 판정
+                if hasattr(api, "check_task_success") and api.check_task_success():
+                    logger.info("[SUCCESS] Task completed.")
+                elif getattr(api, "completed", False):
+                    logger.info("[SUCCESS] Marked completed.")
+                else:
+                    logger.info("[INFO] Not marked as completed. Check robot/logs.")
+
+            except KeyboardInterrupt:
+                print("\nInterrupted by user.")
+                break
+            except Exception as e:
+                print("[FATAL ERROR]:", e)
+                print(traceback.format_exc())
+                break
+
+    finally:
+        env_process.terminate()
+        env_process.join()
